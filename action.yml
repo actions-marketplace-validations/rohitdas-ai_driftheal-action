@@ -1,0 +1,97 @@
+name: 'DriftHeal Self-Healing Action'
+description: 'Autonomous cross-repository API contract guardian and self-healing engine'
+inputs:
+  payload-ref:
+    description: 'Reference ID of the payload in edge KV'
+    required: true
+  github-token:
+    description: 'GitHub token with contents:write and pull-requests:write permissions'
+    required: true
+  edge-kv-gateway-url:
+    description: 'Cloudflare Worker edge URL'
+    required: true
+  ai-gateway-url:
+    description: 'AI gateway endpoint URL'
+    required: true
+  ai-api-key:
+    description: 'API key for the AI gateway'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+        
+    - name: Install DriftHeal CLI
+      shell: bash
+      run: npm install -g @driftheal/cli
+
+    - name: Fetch Drift Payload from KV via OIDC
+      shell: bash
+      env:
+        PAYLOAD_REF: ${{ inputs.payload-ref }}
+        EDGE_KV_GATEWAY_URL: ${{ inputs.edge-kv-gateway-url }}
+      run: |
+        OIDC_TOKEN=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fgithub.com%2FDriftHeal" | jq -r '.value')
+        
+        echo "Fetching payload for reference: $PAYLOAD_REF"
+        FETCH_SUCCESS=false
+        for i in {1..5}; do
+          # Write to a temp file first; only move it on success to prevent curl -o creating an empty file on failure
+          if curl -s -f -H "Authorization: Bearer $OIDC_TOKEN" "$EDGE_KV_GATEWAY_URL/payload/$PAYLOAD_REF" -o "$RUNNER_TEMP/payload.tmp.json"; then
+            mv "$RUNNER_TEMP/payload.tmp.json" "$RUNNER_TEMP/payload.json"
+            FETCH_SUCCESS=true
+            break
+          fi
+          echo "Payload not ready yet, retrying in 3 seconds... (Attempt $i/5)"
+          sleep 3
+        done
+        
+        if [ "$FETCH_SUCCESS" != "true" ]; then
+          echo "Error: Failed to fetch payload from edge gateway after 5 attempts."
+          exit 1
+        fi
+
+    - name: Sync Schema & Generate Updated Client Types
+      shell: bash
+      env:
+        PAYLOAD_PATH: ${{ runner.temp }}/payload.json
+      run: |
+        node -e "
+          const fs = require('fs');
+          const path = require('path');
+          // Use JSON.parse(readFileSync()) instead of require() for ESM/CJS compatibility
+          const payload = JSON.parse(fs.readFileSync(process.env.PAYLOAD_PATH, 'utf8'));
+          const mappings = payload.schema_mappings || {};
+          for (const [file, content] of Object.entries(payload.schema_files || {})) {
+            const downstreamPath = mappings[file] || file;
+            const resolvedCwd = path.resolve(process.cwd());
+            const safePath = path.resolve(resolvedCwd, downstreamPath);
+            const relative = path.relative(resolvedCwd, safePath);
+            if (relative.startsWith('..') || path.isAbsolute(relative) || relative === '') {
+              console.error('Path traversal or invalid path detected:', downstreamPath);
+              process.exit(1);
+            }
+            fs.mkdirSync(path.dirname(safePath), { recursive: true });
+            // content is an object containing { before, after }. Extract the 'after' content.
+            const fileContent = typeof content === 'string' ? content : (content && content.after) || '';
+            fs.writeFileSync(safePath, fileContent);
+          }
+        "
+        # Use Node for reliable script key detection (removes jq dependency on self-hosted runners)
+        if [ -f "package.json" ] && node -e "const pkg = require('./package.json'); if (!pkg.scripts || !pkg.scripts['generate-types']) process.exit(1);" >/dev/null 2>&1; then
+          npm run generate-types
+        fi
+
+    - name: Run Self-Healing Loop
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        AI_GATEWAY_URL: ${{ inputs.ai-gateway-url }}
+        AI_API_KEY: ${{ inputs.ai-api-key }}
+        PAYLOAD_PATH: ${{ runner.temp }}/payload.json
+      run: |
+        driftheal heal --payload-path "$PAYLOAD_PATH"
