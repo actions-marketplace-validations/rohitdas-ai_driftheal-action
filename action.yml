@@ -1,5 +1,8 @@
 name: 'DriftHeal Self-Healing Action'
 description: 'Autonomous cross-repository API contract guardian and self-healing engine'
+branding:
+  icon: 'shield'
+  color: 'blue'
 inputs:
   payload-ref:
     description: 'Reference ID of the payload in edge KV'
